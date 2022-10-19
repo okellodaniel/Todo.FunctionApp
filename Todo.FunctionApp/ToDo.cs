@@ -68,6 +68,8 @@ public static class ToDoApi
 
         var updated = JsonConvert.DeserializeObject<TodoUpdateModel>(reqBody);
 
+        todo.IsCompleted = updated.IsCompleted;
+
         if (!string.IsNullOrEmpty(updated.TaskDescription))
         {
             todo.TaskDescription = updated.TaskDescription;
