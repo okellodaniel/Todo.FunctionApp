@@ -1,94 +1,117 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Table;
 using Newtonsoft.Json;
-using System.Collections.Generic;
-using System.Linq;
+using Todo.FunctionApp;
 
-namespace Todo.FunctionApp;
+namespace ToDoFunction;
 
 public static class ToDoApi
 {
-    private static List<ToDo>items = new List<ToDo>();
-
     [FunctionName("CreateTodo")]
     public static async Task<IActionResult> CreateTodo(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "todo")] HttpRequest req, TraceWriter log)
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "todo")] HttpRequest req, TraceWriter log,
+        [Table("todos", Connection="AzureWebJobStorage")] IAsyncCollector<TodoTableEntity> todoTable
+        )
     {
         log.Info("C# a new To do item");
 
-        string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+        var requestBody = await new StreamReader(req.Body).ReadToEndAsync();
 
         var input = JsonConvert.DeserializeObject<ToDoCreateModel>(requestBody);
 
         var todo = new ToDo { TaskDescription = input.TaskDescription };
 
-        items.Add(todo);
+        await todoTable.AddAsync(todo.ToTableEntity());
 
         return new OkObjectResult(todo);
  
     }
 
     [FunctionName("GetTodos")]
-    public static IActionResult GetTodos(
-        [HttpTrigger(AuthorizationLevel.Anonymous,"get",Route = "todo")]HttpRequest req, TraceWriter log)
+    public static async Task<IActionResult> GetTodos(
+        [HttpTrigger(AuthorizationLevel.Anonymous,"get",Route = "todo")]HttpRequest req, 
+        [Table("todos", Connection="AzureWebJobStorage")] CloudTable todoTable
+        ,TraceWriter log)
     {
         log.Info("Getting todo list items");
-
-        return new OkObjectResult(items);
+        
+        var query = new TableQuery<TodoTableEntity>();
+        
+        var segment = await todoTable.ExecuteQuerySegmentedAsync(query, null);
+        
+        return new OkObjectResult(segment.Select(Mappings.ToToDo));
     }
 
     [FunctionName("GetTodoById")]
     public static IActionResult GetTodoById(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "todo/{id}")] HttpRequest req, TraceWriter log, string id)
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "todo/{id}")] HttpRequest req,
+        [Table("todos","TODO","{id}",Connection = "AzureWebJobStorage")] TodoTableEntity todo,
+        TraceWriter log, string id)
     {
         log.Info("Getting todo item");
+        
+        if (todo == null) throw new Exception($"Item with id: {id} not found");
 
-        var item = items.FirstOrDefault(t => t.Id == id);
-
-        if (item == null) throw new Exception($"Item with id: {id} not found");
-
-        return new OkObjectResult(item);
+        return new OkObjectResult(todo.ToToDo());
     }
 
     [FunctionName("UpdateTodo")]
-    public static async Task<IActionResult> UpdateTodo([HttpTrigger(AuthorizationLevel.Anonymous,"put",Route="todo/{id}")]HttpRequest req,string id,TraceWriter log)
+    public static async Task<IActionResult> UpdateTodo([HttpTrigger(AuthorizationLevel.Anonymous,"put",Route="todo/{id}")]HttpRequest req,string id,
+        [Table("todos",Connection = "AzureWebJobStorage")] CloudTable todoTable
+        ,TraceWriter log)
     {
-        log.Info("Updating todo item");
-        var todo = items.FirstOrDefault(t => t.Id == id);
-
-        if (todo == null) return new NotFoundResult();
-
         string reqBody = await new StreamReader(req.Body).ReadToEndAsync();
 
         var updated = JsonConvert.DeserializeObject<TodoUpdateModel>(reqBody);
 
-        todo.IsCompleted = updated.IsCompleted;
+        var findOperation = TableOperation.Retrieve<TodoTableEntity>("TODO", id);
+        var findResult = await todoTable.ExecuteAsync(findOperation);
 
-        if (!string.IsNullOrEmpty(updated.TaskDescription))
-        {
-            todo.TaskDescription = updated.TaskDescription;
-        }
+        if (findResult.Result == null) return new NotFoundResult();
 
-        return new OkObjectResult(todo);
+        var existingRow = (TodoTableEntity)findResult.Result;
+        
+        existingRow.IsCompleted = updated.IsCompleted;
+        
+        if (!string.IsNullOrEmpty(updated.TaskDescription)) existingRow.TaskDesciption = updated.TaskDescription;
+
+        var replaceOperation = TableOperation.Replace(existingRow);
+        
+        await todoTable.ExecuteAsync(replaceOperation);
+
+        return new OkObjectResult(existingRow.ToToDo());
     }
 
     [FunctionName("DeleteTodo")]
-    public static IActionResult DeleteTodo(
-      [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "todo/{id}")] HttpRequest req, TraceWriter log, string id)
+    public static async Task<IActionResult> DeleteTodo(
+      [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "todo/{id}")] HttpRequest req, TraceWriter log,
+      [Table("todos",Connection = "AzureWebJobStorage")] CloudTable todoTable
+      , string id)
     {
-        log.Info("Deleting todo item");
-
-        var item = items.FirstOrDefault(t => t.Id == id);
-
-        if (item == null) throw new Exception($"Item with id: {id} not found");
-
-        items.Remove(item);
+        var deleteOperation = TableOperation.Delete(new TableEntity()
+        {
+            PartitionKey = "TODO",
+            RowKey = id,
+            ETag = "*"
+        });
+        try
+        {
+            var deleteResult = await todoTable.ExecuteAsync(deleteOperation);
+        }
+        catch (StorageException e) when (e.RequestInformation.HttpStatusCode == 404)
+        {
+            return new NotFoundResult();
+            
+        }
 
         return new OkResult();
     }
